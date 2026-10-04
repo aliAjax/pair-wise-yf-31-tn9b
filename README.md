@@ -23,6 +23,19 @@ python3 app.py --db airline_recovery.db
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
 
+## 可续期资源租约
+
+保存调整（`POST /api/recovery-plans`、`POST /api/plans/{id}/assignments`）时，系统按航段时段为飞机和机组占用资源租约。重叠时段只允许一张有效租约；晚到的保存会收到 `lease_conflict`，详情给出占用方（`occupant`）和同一时段空闲的同类候选（`candidates`）。
+
+- `POST /api/plans/{id}/renew`：续期方案下全部有效租约（延长 `expires_at`）。
+- `GET /api/plans/{id}/leases`：查看方案的租约与过期状态。
+- 租约过期后不再占用资源，其它方案可在该时段建立新租约。有效期由环境变量 `AIRLINE_LEASE_SECONDS` 配置，默认 600 秒。
+
+## 中断窗口更新与方案接管
+
+- `POST /api/disruptions/{id}/window`：更新中断窗口。旧方案立即失效（状态置为 `stale`）并释放租约，等待重算或接管。
+- `POST /api/plans/{id}/takeover`：运行经理让接管方案接手已锁定方案，按最新窗口重算延误并接管租约。写入失败时事务回滚、回到原租约重试；接管差异（`diff`）写入审计日志，控制台可查。请求体可带 `assignments` 覆盖部分航段的飞机、机组或时刻。
+
 ## 测试
 
 ```bash

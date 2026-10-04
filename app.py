@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,8 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
+# 资源租约有效期（秒）：保存调整时按航段时段占用飞机和机组，可续期。
+LEASE_SECONDS = int(os.environ.get("AIRLINE_LEASE_SECONDS", "600"))
 
 
 class ApiError(Exception):
@@ -96,8 +98,28 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS resource_leases(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                assignment_id INTEGER NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+                resource_type TEXT NOT NULL, resource_id TEXT NOT NULL,
+                starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, renewed_at TEXT NOT NULL,
+                UNIQUE(plan_id, assignment_id, resource_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_leases_resource ON resource_leases(resource_type, resource_id, status, starts_at, ends_at);
             """
         )
+        # 兼容旧库：补充接管来源字段与租约的航段关联。
+        for column in ("takeover_of INTEGER",):
+            try:
+                self.conn.execute(f"ALTER TABLE recovery_plans ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self.conn.execute("ALTER TABLE resource_leases ADD COLUMN assignment_id INTEGER REFERENCES assignments(id) ON DELETE CASCADE")
+        except sqlite3.OperationalError:
+            pass
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -237,14 +259,20 @@ class AirlineRecoveryService:
                              (item["aircraft_id"], item["crew_id"], iso(std), iso(sta), item.get("status", "planned"), delay, missed, plan_id, item["flight_id"]))
                 if conn.execute("SELECT changes()").fetchone()[0] == 0:
                     raise KeyError
+                assignment_id = conn.execute("SELECT id FROM assignments WHERE plan_id=? AND flight_id=?", (plan_id, item["flight_id"])).fetchone()["id"]
             else:
-                conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
+                cur = conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
                                 VALUES(?,?,?,?,?,?,?,?,?)""",
                              (plan_id, item["flight_id"], item["aircraft_id"], item["crew_id"], iso(std), iso(sta), item.get("status", "planned"), delay, missed))
+                assignment_id = cur.lastrowid
         except sqlite3.IntegrityError as exc:
             raise ApiError(409, "assignment_conflict", "方案中该航班已存在或资源无效") from exc
         except KeyError as exc:
             raise ApiError(404, "assignment_not_found", "待替换的航班调整不存在") from exc
+        # 改派会换飞机/机组或时刻：先释放该航段旧租约，再按新航段占用。
+        conn.execute("UPDATE resource_leases SET status='released' WHERE assignment_id=? AND status='active'", (assignment_id,))
+        # 保存调整即按航段时段占用飞机和机组；重叠时段已有有效租约时拒绝并回滚。
+        self._acquire_leases(conn, plan_id, assignment_id, item["aircraft_id"], item["crew_id"], std, sta)
 
     def add_assignment(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "assignment_forbidden", "当前角色不能修改方案")
@@ -259,6 +287,91 @@ class AirlineRecoveryService:
             conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
             return self.get_plan(plan_id)
+
+    # ---- 资源租约：保存调整时按航段时段占用飞机和机组，重叠时段只有一张有效租约 ----
+
+    @staticmethod
+    def _lease_window(starts: datetime, ends: datetime) -> tuple[str, str]:
+        return iso(starts), iso(ends)
+
+    def _find_lease_conflicts(self, conn: sqlite3.Connection, plan_id: int, resource_type: str,
+                              resource_id: str, starts: datetime, ends: datetime) -> list[dict[str, Any]]:
+        """返回与本方案在该航段时段重叠的其它有效租约（已过期的不算）。"""
+        now = iso()
+        start_s, end_s = self._lease_window(starts, ends)
+        rows = conn.execute("""
+            SELECT l.*, p.name AS plan_name, p.status AS plan_status
+            FROM resource_leases l JOIN recovery_plans p ON p.id=l.plan_id
+            WHERE l.resource_type=? AND l.resource_id=? AND l.status='active'
+              AND l.plan_id!=? AND l.expires_at>?
+              AND l.starts_at<? AND l.ends_at>?
+            ORDER BY l.starts_at
+        """, (resource_type, resource_id, plan_id, now, end_s, start_s)).fetchall()
+        return [dict(r) for r in rows]
+
+    def _candidate_resources(self, conn: sqlite3.Connection, resource_type: str,
+                             starts: datetime, ends: datetime) -> list[dict[str, Any]]:
+        """找出同一时段内空闲的同类资源（未被任何有效租约占用）。"""
+        now = iso()
+        start_s, end_s = self._lease_window(starts, ends)
+        table = "aircraft" if resource_type == "aircraft" else "crew"
+        busy = {r["resource_id"] for r in conn.execute("""
+            SELECT DISTINCT resource_id FROM resource_leases
+            WHERE resource_type=? AND status='active' AND expires_at>?
+              AND starts_at<? AND ends_at>?
+        """, (resource_type, now, end_s, start_s)).fetchall()}
+        return [dict(r) for r in conn.execute(f"SELECT * FROM {table} WHERE status='active' ORDER BY id") if r["id"] not in busy]
+
+    def _acquire_leases(self, conn: sqlite3.Connection, plan_id: int, assignment_id: int,
+                        aircraft_id: str, crew_id: str, starts: datetime, ends: datetime) -> None:
+        now = utcnow()
+        expires = iso(now + timedelta(seconds=LEASE_SECONDS))
+        ts = iso(now)
+        for resource_type, resource_id in (("aircraft", aircraft_id), ("crew", crew_id)):
+            conflicts = self._find_lease_conflicts(conn, plan_id, resource_type, resource_id, starts, ends)
+            if conflicts:
+                occupant = conflicts[0]
+                candidates = self._candidate_resources(conn, resource_type, starts, ends)
+                raise ApiError(409, "lease_conflict",
+                    f"{resource_type} {resource_id} 在 {self._lease_window(starts, ends)[0]}~{self._lease_window(starts, ends)[1]} "
+                    f"已被方案「{occupant['plan_name']}」占用",
+                    {"resource_type": resource_type, "resource_id": resource_id,
+                     "window": {"starts_at": self._lease_window(starts, ends)[0], "ends_at": self._lease_window(starts, ends)[1]},
+                     "occupant": {"plan_id": occupant["plan_id"], "plan_name": occupant["plan_name"],
+                                  "lease_id": occupant["id"], "plan_status": occupant["plan_status"],
+                                  "starts_at": occupant["starts_at"], "ends_at": occupant["ends_at"],
+                                  "expires_at": occupant["expires_at"]},
+                     "candidates": candidates,
+                     "all_conflicts": [{"plan_id": c["plan_id"], "plan_name": c["plan_name"],
+                                        "starts_at": c["starts_at"], "ends_at": c["ends_at"]} for c in conflicts]})
+            conn.execute("""INSERT OR REPLACE INTO resource_leases
+                            (plan_id,assignment_id,resource_type,resource_id,starts_at,ends_at,status,expires_at,created_at,renewed_at)
+                            VALUES(?,?,?,?,?,?,'active',?,?,?)""",
+                         (plan_id, assignment_id, resource_type, resource_id, *self._lease_window(starts, ends), expires, ts, ts))
+
+    def renew_plan_leases(self, plan_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "lease_forbidden", "当前角色不能续期租约")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] not in {"draft", "locked"}: raise ApiError(409, "plan_not_leasable", "当前方案状态不能续期租约")
+            now = utcnow(); expires = iso(now + timedelta(seconds=LEASE_SECONDS)); ts = iso(now)
+            conn.execute("UPDATE resource_leases SET expires_at=?, renewed_at=? WHERE plan_id=? AND status='active'",
+                        (expires, ts, plan_id))
+            renewed = conn.execute("SELECT changes()").fetchone()[0]
+            leases = [dict(r) for r in conn.execute("SELECT * FROM resource_leases WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()]
+            Repository.audit(conn, plan_id, actor, role, "leases_renewed", {"renewed": renewed, "expires_at": expires})
+            return {"plan_id": plan_id, "renewed": renewed, "expires_at": expires, "leases": leases}
+
+    def list_plan_leases(self, plan_id: int) -> dict[str, Any]:
+        conn = self.repo.conn
+        plan = conn.execute("SELECT id,name,status FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+        if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+        leases = [dict(r) for r in conn.execute("SELECT * FROM resource_leases WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()]
+        now = iso()
+        for lease in leases:
+            lease["expired"] = lease["status"] == "active" and lease["expires_at"] <= now
+        return {"plan": dict(plan), "server_time": now, "leases": leases}
 
     def _validate_plan(self, conn: sqlite3.Connection, plan_id: int) -> list[dict[str, Any]]:
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -334,14 +447,22 @@ class AirlineRecoveryService:
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
             problems = self._validate_plan(conn, plan_id)
             if problems: raise ApiError(409, "plan_invalid", "方案未通过约束校验", problems)
-            conflicts = []
+            # 租约是资源占用的唯一凭据：锁定前再次校验，防止租约过期后被他人抢先。
             for row in conn.execute("SELECT * FROM assignments WHERE plan_id=? AND status!='canceled'", (plan_id,)).fetchall():
-                conflicting = conn.execute("""SELECT a.*,p.name plan_name FROM assignments a JOIN recovery_plans p ON p.id=a.plan_id
-                    WHERE p.id!=? AND p.status='locked' AND a.status!='canceled' AND (a.aircraft_id=? OR a.crew_id=?)
-                    AND a.new_std<? AND a.new_sta>?""",
-                    (plan_id, row["aircraft_id"], row["crew_id"], row["new_sta"], row["new_std"])).fetchall()
-                conflicts.extend({"assignment_id": row["id"], "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]} for item in conflicting)
-            if conflicts: raise ApiError(409, "locked_resource_conflict", "与已锁定方案存在飞机或机组冲突", conflicts)
+                for resource_type, resource_id in (("aircraft", row["aircraft_id"]), ("crew", row["crew_id"])):
+                    lease_conflicts = self._find_lease_conflicts(conn, plan_id, resource_type, resource_id,
+                                                                 parse_time(row["new_std"]), parse_time(row["new_sta"]))
+                    if lease_conflicts:
+                        occupant = lease_conflicts[0]
+                        candidates = self._candidate_resources(conn, resource_type, parse_time(row["new_std"]), parse_time(row["new_sta"]))
+                        raise ApiError(409, "lease_conflict",
+                            f"{resource_type} {resource_id} 在该航段时段已被方案「{occupant['plan_name']}」占用",
+                            {"resource_type": resource_type, "resource_id": resource_id,
+                             "window": {"starts_at": row["new_std"], "ends_at": row["new_sta"]},
+                             "occupant": {"plan_id": occupant["plan_id"], "plan_name": occupant["plan_name"],
+                                          "lease_id": occupant["id"], "starts_at": occupant["starts_at"],
+                                          "ends_at": occupant["ends_at"], "expires_at": occupant["expires_at"]},
+                             "candidates": candidates})
             metrics = self._metrics(conn, plan_id)
             conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
                          (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
@@ -382,6 +503,103 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def update_disruption_window(self, disruption_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "disruption_forbidden", "当前角色不能更新中断窗口")
+        starts, ends = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
+        if ends <= starts: raise ApiError(400, "invalid_times", "中断结束时间必须晚于开始时间")
+        with self.repo.tx() as conn:
+            disruption = conn.execute("SELECT * FROM disruptions WHERE id=?", (disruption_id,)).fetchone()
+            if not disruption: raise ApiError(404, "disruption_not_found", "中断事件不存在")
+            conn.execute("UPDATE disruptions SET starts_at=?, ends_at=? WHERE id=?", (iso(starts), iso(ends), disruption_id))
+            # 窗口更新后，旧方案立即失效并释放租约，等待重算或接管。
+            invalidated = []
+            for plan in conn.execute("SELECT id,name,status FROM recovery_plans WHERE disruption_id=? AND status IN ('draft','locked') ORDER BY id", (disruption_id,)):
+                conn.execute("UPDATE resource_leases SET status='released' WHERE plan_id=? AND status='active'", (plan["id"],))
+                conn.execute("UPDATE recovery_plans SET status='stale' WHERE id=?", (plan["id"],))
+                invalidated.append({"plan_id": plan["id"], "plan_name": plan["name"], "was_status": plan["status"]})
+                Repository.audit(conn, plan["id"], actor, role, "plan_invalidated", {"reason": "disruption_window_updated",
+                    "starts_at": iso(starts), "ends_at": iso(ends)})
+            Repository.audit(conn, None, actor, role, "disruption_window_updated",
+                             {"disruption_id": disruption_id, "invalidated": [item["plan_id"] for item in invalidated]})
+            updated = conn.execute("SELECT * FROM disruptions WHERE id=?", (disruption_id,)).fetchone()
+            return {"disruption": dict(updated), "invalidated_plans": invalidated}
+
+    def takeover_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """运行经理让接管方案接手已锁定方案：按最新窗口重算延误，写入失败回到原租约重试。"""
+        if role != "ops_manager": raise ApiError(403, "takeover_forbidden", "只有运行经理可以接管方案")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        overrides = body.get("assignments", [])
+        if not isinstance(overrides, list): raise ApiError(400, "invalid_assignments", "assignments 必须是列表")
+        original = self.repo.conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+        if not original: raise ApiError(404, "plan_not_found", "方案不存在")
+        if original["status"] != "locked": raise ApiError(409, "not_locked", "只有已锁定方案可以被接管")
+        if original["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
+        disruption = self.repo.conn.execute("SELECT * FROM disruptions WHERE id=?", (original["disruption_id"],)).fetchone()
+        if not disruption: raise ApiError(404, "disruption_not_found", "中断事件不存在")
+        last_error: ApiError | None = None
+        for _attempt in range(2):
+            try:
+                with self.repo.tx() as conn:
+                    return self._do_takeover(conn, original, disruption, actor, overrides)
+            except ApiError as exc:
+                if exc.code != "lease_conflict": raise
+                last_error = exc
+                # 事务回滚后原方案租约保持不变，下一轮重新尝试写入。
+        assert last_error is not None
+        raise last_error
+
+    def _do_takeover(self, conn: sqlite3.Connection, original: sqlite3.Row, disruption: sqlite3.Row,
+                     actor: str, overrides: list[dict[str, Any]]) -> dict[str, Any]:
+        override_by_flight: dict[int, dict[str, Any]] = {}
+        for item in overrides:
+            if not isinstance(item.get("flight_id"), int): raise ApiError(400, "invalid_assignment", "接管调整缺少 flight_id")
+            override_by_flight[item["flight_id"]] = item
+        cur = conn.execute("INSERT INTO recovery_plans(disruption_id,name,created_by,created_at,status,takeover_of) VALUES(?,?,?,?,'locked',?)",
+                          (original["disruption_id"], f"接管-{original['name']}", actor, iso(), original["id"]))
+        takeover_id = cur.lastrowid
+        diffs: list[dict[str, Any]] = []
+        takeover_assignments: list[dict[str, Any]] = []
+        for oa in conn.execute("""SELECT a.*, f.flight_no, f.std AS f_std FROM assignments a JOIN flights f ON f.id=a.flight_id
+                                  WHERE a.plan_id=? ORDER BY a.new_std""", (original["id"],)).fetchall():
+            ov = override_by_flight.get(oa["flight_id"], {})
+            aircraft_id = ov.get("aircraft_id", oa["aircraft_id"])
+            crew_id = ov.get("crew_id", oa["crew_id"])
+            new_std = parse_time(ov["new_std"]) if ov.get("new_std") else parse_time(oa["new_std"])
+            new_sta = parse_time(ov["new_sta"]) if ov.get("new_sta") else parse_time(oa["new_sta"])
+            if new_sta <= new_std: raise ApiError(400, "invalid_times", "新到达时间必须晚于新起飞时间")
+            # 按最新窗口重算延误：相对航班当前时刻。
+            delay = max(0, int((new_std - parse_time(oa["f_std"])).total_seconds() // 60))
+            missed = int(ov.get("missed_connections", oa["missed_connections"]))
+            cur2 = conn.execute("""INSERT INTO assignments(plan_id,flight_id,aircraft_id,crew_id,new_std,new_sta,status,delay_minutes,missed_connections)
+                                   VALUES(?,?,?,?,?,?, 'active',?,?)""",
+                                (takeover_id, oa["flight_id"], aircraft_id, crew_id, iso(new_std), iso(new_sta), delay, missed))
+            takeover_assignments.append({"id": cur2.lastrowid, "flight_id": oa["flight_id"],
+                                         "aircraft_id": aircraft_id, "crew_id": crew_id,
+                                         "new_std": new_std, "new_sta": new_sta, "delay_minutes": delay})
+            diffs.append({"flight_id": oa["flight_id"], "flight_no": oa["flight_no"],
+                          "before": {"aircraft_id": oa["aircraft_id"], "crew_id": oa["crew_id"],
+                                     "new_std": oa["new_std"], "new_sta": oa["new_sta"], "delay_minutes": oa["delay_minutes"]},
+                          "after": {"aircraft_id": aircraft_id, "crew_id": crew_id,
+                                    "new_std": iso(new_std), "new_sta": iso(new_sta), "delay_minutes": delay}})
+        # 先释放原方案租约，再由接管方案写入；写入冲突时整笔回滚，原租约不变。
+        conn.execute("UPDATE resource_leases SET status='taken_over' WHERE plan_id=? AND status='active'", (original["id"],))
+        for ta in takeover_assignments:
+            self._acquire_leases(conn, takeover_id, ta["id"], ta["aircraft_id"], ta["crew_id"], ta["new_std"], ta["new_sta"])
+        problems = self._validate_plan(conn, takeover_id)
+        if problems: raise ApiError(409, "plan_invalid", "接管方案未通过约束校验", problems)
+        for ta in takeover_assignments:
+            conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
+                         (iso(ta["new_std"]), iso(ta["new_sta"]), ta["aircraft_id"], ta["crew_id"], max(0, ta["delay_minutes"]), iso(), ta["flight_id"]))
+        conn.execute("UPDATE recovery_plans SET status='superseded' WHERE id=?", (original["id"],))
+        metrics = self._metrics(conn, takeover_id)
+        conn.execute("""UPDATE recovery_plans SET metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
+                     (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, takeover_id))
+        Repository.audit(conn, takeover_id, actor, "ops_manager", "plan_takeover",
+                         {"takeover_of": original["id"], "disruption_window": {"starts_at": disruption["starts_at"], "ends_at": disruption["ends_at"]}, "diff": diffs})
+        Repository.audit(conn, original["id"], actor, "ops_manager", "plan_taken_over", {"takeover_plan_id": takeover_id})
+        return self.get_plan(takeover_id)
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -391,6 +609,7 @@ class AirlineRecoveryService:
         result["metrics"] = json.loads(plan["metrics_json"]) if plan["metrics_json"] else self._metrics(conn, plan_id)
         result["score"] = json.loads(plan["score_json"]) if plan["score_json"] else None
         result["assignments"] = assignments
+        result["leases"] = [dict(r) for r in conn.execute("SELECT * FROM resource_leases WHERE plan_id=? ORDER BY id", (plan_id,)).fetchall()]
         return result
 
     def compare_plans(self, disruption_id: int) -> dict[str, Any]:
@@ -435,6 +654,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state()
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "leases": return 200, self.service.list_plan_leases(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -454,10 +674,14 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "renew": return 200, self.service.renew_plan_leases(plan_id, actor, role)
+            if action == "takeover": return 201, self.service.takeover_plan(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
             if action == "recover": return 200, self.service.recover_flight(flight_id, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "window":
+            return 200, self.service.update_disruption_window(int(parts[2]), actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
         parsed = urlparse(self.path)

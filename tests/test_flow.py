@@ -43,12 +43,14 @@ class AirlineFlowTest(unittest.TestCase):
         self.svc.lock_plan(plan1["id"], "ops", "ops_manager", {"expected_revision": 1})
         flight2 = self.make_flight("AB102", "AC2", "CR2")
         disruption2 = self.svc.create_disruption("sched", "scheduler", {"kind": "airport_closure", "resource_id": "AAA", "starts_at": iso(self.base), "ends_at": iso(self.base + timedelta(hours=1))})
-        plan2 = self.svc.create_plan("sched", "scheduler", {"disruption_id": disruption2["id"], "name": "冲突方案", "assignments": [{"flight_id": flight2["id"], "aircraft_id": "AC2", "crew_id": "CR2", "new_std": iso(self.base + timedelta(hours=2, minutes=30)), "new_sta": iso(self.base + timedelta(hours=4, minutes=30))}]})
+        # 保存调整时即按航段占用资源：重叠时段只有一张有效租约，晚到方案看到占用方和空闲候选。
         with self.assertRaises(ApiError) as ctx:
-            self.svc.lock_plan(plan2["id"], "ops", "ops_manager", {"expected_revision": 1})
-        self.assertEqual(ctx.exception.code, "locked_resource_conflict")
+            self.svc.create_plan("sched", "scheduler", {"disruption_id": disruption2["id"], "name": "冲突方案", "assignments": [{"flight_id": flight2["id"], "aircraft_id": "AC2", "crew_id": "CR2", "new_std": iso(self.base + timedelta(hours=2, minutes=30)), "new_sta": iso(self.base + timedelta(hours=4, minutes=30))}]})
+        self.assertEqual(ctx.exception.code, "lease_conflict")
+        self.assertEqual(ctx.exception.details["occupant"]["plan_id"], plan1["id"])
+        self.assertIn("AC1", [c["id"] for c in ctx.exception.details["candidates"]])
         with self.assertRaises(ApiError) as ctx:
-            self.svc.lock_plan(plan2["id"], "sched", "scheduler", {"expected_revision": 1})
+            self.svc.lock_plan(plan1["id"], "sched", "scheduler", {"expected_revision": 1})
         self.assertEqual(ctx.exception.status, 403)
         with self.assertRaises(ApiError) as ctx:
             self.svc.add_assignment(plan1["id"], "sched", "scheduler", {"expected_revision": 1, "flight_id": flight1["id"], "aircraft_id": "AC1", "crew_id": "CR1", "new_std": iso(self.base), "new_sta": iso(self.base + timedelta(hours=2))})
