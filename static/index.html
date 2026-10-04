@@ -1,3 +1,76 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:32px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#475569}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #e2e8f0;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f1f5f9}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.held{background:#0f766e}.intended{background:#b45309}.locked{background:#1d4ed8}
+.stale{background:#b91c1c}.superseded{background:#64748b}.draft{background:#475569}
+.muted{color:#64748b;font-size:13px}.good{color:#0f766e}.bad{color:#b91c1c}
+h2{margin-top:0;font-size:18px}
+</style>
+<h1>航班恢复控制台</h1>
+<p class="muted">查看航班、中断、方案、<b>有效资源租约</b>与<b>接管差异留存</b>。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p>
+<section>
+  身份 <input id="u" value="ops" style="width:80px">
+  角色 <select id="r"><option>ops_manager</option><option>scheduler</option><option>auditor</option><option>viewer</option></select>
+  <button onclick="load()">刷新</button>
+  <button class="ghost" onclick="loadRaw()">原始 JSON</button>
+</section>
+<section><h2>有效资源租约（重叠时段只有一张有效租约）</h2><div id="leases"></div></section>
+<section><h2>恢复方案</h2><div id="plans"></div></section>
+<section><h2>接管差异留存</h2><div id="takeovers"></div></section>
+<section id="rawsec" style="display:none"><h2>原始 /api/state</h2><pre id="o"></pre></section>
+<script>
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const tag=s=>`<span class="tag ${s}">${s}</span>`;
+function leasesTable(list){
+  if(!list.length) return '<p class="muted">当前没有 held/intended 租约。</p>';
+  return `<table><tr><th>资源</th><th>占用时段</th><th>状态</th><th>方案</th><th>到期 (UTC)</th></tr>`+
+    list.map(l=>`<tr><td>${l.resource_type}:${esc(l.resource_id)}</td><td>${l.starts_at.replace('T',' ')} → ${l.ends_at.replace('T',' ')}Z</td>
+      <td>${tag(l.state)}</td><td>#${l.plan_id} ${esc(l.plan_name)}</td><td>${l.expires_at?l.expires_at.replace('T',' ')+'Z':'<b>永久（已锁定）</b>'}</td></tr>`).join('')+`</table>`;
+}
+function plansTable(plans){
+  return `<table><tr><th>#</th><th>方案</th><th>状态</th><th>窗口</th><th>接管目标</th><th>航段调整</th></tr>`+
+    plans.map(p=>`<tr><td>${p.id}</td><td>${esc(p.name)}<div class="muted">rev ${p.revision} · by ${esc(p.created_by)}</div></td>
+      <td>${tag(p.status)}${p.window_stale?' <span class="bad">⚠ 窗口落后</span>':''}</td>
+      <td>rev ${p.window_revision}</td>
+      <td>${p.takeover_target?`#${p.takeover_target.id} ${esc(p.takeover_target.name)} ${tag(p.takeover_target.status)}`:'—'}</td>
+      <td>${p.assignments.filter(a=>a.status!=='canceled').map(a=>`${esc(a.flight_no)}: ${esc(a.aircraft_id)}/${esc(a.crew_id)} @${a.new_std.replace('T',' ')}Z (延误${a.delay_minutes}m)`).join('<br>')||'—'}</td></tr>`).join('')+`</table>`;
+}
+function takeoversBlock(list){
+  if(!list.length) return '<p class="muted">尚无接管记录。</p>';
+  return list.map(t=>{
+    const d=t.diff;
+    const legs=d.legs.map(l=>`<tr><td>${esc(l.flight_no)}</td>
+      <td>${esc(l.aircraft_from)}→<b>${esc(l.aircraft_to)}</b><br>${esc(l.crew_from)}→<b>${esc(l.crew_to)}</b></td>
+      <td class="muted">${l.target_std||''}</td><td>${esc(l.new_std)}</td>
+      <td>${l.target_delay_minutes} → <b class="${l.new_delay_minutes>l.target_delay_minutes?'bad':'good'}">${l.new_delay_minutes}</b></td></tr>`).join('');
+    return `<p><b>#${t.id}</b> 方案 #${t.taking_plan_id} 接管 #${t.target_plan_id}（中断 #${t.disruption_id}，窗口 rev ${t.window_revision}）
+      · ${t.created_at} · 写入尝试 ${t.attempts} 次 · 操作者 ${esc(t.created_by)}
+      · 总延误变化 <b class="${d.total_delay_delta_minutes>0?'bad':'good'}">${d.total_delay_delta_minutes>=0?'+':''}${d.total_delay_delta_minutes} 分钟</b></p>
+      <table><tr><th>航班</th><th>飞机/机组</th><th>目标时刻</th><th>接管后时刻</th><th>延误(分钟)</th></tr>${legs}</table>`;
+  }).join('<hr>');
+}
+async function load(){
+  let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});
+  let j=await x.json();
+  if(j.error){leases.innerHTML=plans.innerHTML=takeovers.innerHTML=`<p class="bad">${j.error}: ${j.message}</p>`;return;}
+  leases.innerHTML=leasesTable(j.active_leases);
+  plans.innerHTML=plansTable(j.plans);
+  takeovers.innerHTML=takeoversBlock(j.takeovers);
+  rawsec.style.display='none';
+}
+async function loadRaw(){
+  let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});
+  o.textContent=JSON.stringify(await x.json(),null,2);rawsec.style.display='block';
+}
+load();
+</script>
+</html>
